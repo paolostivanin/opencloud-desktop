@@ -175,7 +175,7 @@ void VfsXAttr::startImpl(const VfsSetupParams &params)
     qCDebug(lcVfsXAttr, "Start XAttr VFS");
 
     // Lets claim the sync root directory for us
-    const auto path = FileSystem::toFilesystemPath(params.filesystemPath);
+    const auto path = params.root();
     // set the owner to opencloud to claim it
     if (!FileSystem::Xattr::setxattr(path, QString::fromUtf8(OpenVfsConstants::XAttributeNames::Owner), xattrOwnerString(params.account->uuid()))) {
         Q_EMIT error(tr("Unable to claim the sync root for files on demand"));
@@ -185,7 +185,7 @@ void VfsXAttr::startImpl(const VfsSetupParams &params)
     auto vfsProcess = new QProcess(this);
     // merging the channels and piping the output to our log lead to deadlocks
     vfsProcess->setProcessChannelMode(QProcess::ForwardedChannels);
-    const auto logPrefix = [vfsProcess, path = params.filesystemPath] { return u"[%1 %2] "_s.arg(QString::number(vfsProcess->processId()), path); };
+    const auto logPrefix = [vfsProcess, path = params.root().toString()] { return u"[%1 %2] "_s.arg(QString::number(vfsProcess->processId()), path); };
     connect(vfsProcess, &QProcess::finished, vfsProcess, [logPrefix, vfsProcess] {
         qCInfo(lcVfsXAttr) << logPrefix() << "finished" << vfsProcess->exitCode();
         vfsProcess->deleteLater();
@@ -194,8 +194,8 @@ void VfsXAttr::startImpl(const VfsSetupParams &params)
         qCInfo(lcVfsXAttr) << logPrefix() << u"started";
         Q_EMIT started();
     });
-    connect(vfsProcess, &QProcess::errorOccurred, this, [logPrefix, vfsProcess, this] { qCWarning(lcVfsXAttr) << logPrefix() << vfsProcess->errorString(); });
-    vfsProcess->start(openVFSExePath(), {u"-d"_s, u"-i"_s, openVFSConfigFilePath(), params.filesystemPath}, QIODevice::ReadOnly);
+    connect(vfsProcess, &QProcess::errorOccurred, this, [logPrefix, vfsProcess] { qCWarning(lcVfsXAttr) << logPrefix() << vfsProcess->errorString(); });
+    vfsProcess->start(openVFSExePath(), {u"-d"_s, u"-i"_s, openVFSConfigFilePath(), params.root().toString()}, QIODevice::ReadOnly);
 }
 
 void VfsXAttr::stop()
@@ -379,14 +379,14 @@ void VfsXAttr::slotHydrateJobFinished()
 
 Result<void, QString> VfsXAttr::createPlaceholder(const SyncFileItem &item)
 {
-    const auto path = FileSystem::toFilesystemPath(params().filesystemPath + item.localName());
+    const auto path = params().root() / item.localName();
     if (std::filesystem::exists(path)) {
         if (item._type == ItemTypeVirtualFileDehydration && FileSystem::fileChanged(path, FileSystem::FileChangedInfo::fromSyncFileItem(&item))) {
             return tr("Cannot dehydrate a placeholder because the file changed");
         }
         Q_ASSERT(item._type == ItemTypeVirtualFile);
     }
-    QFile file(path);
+    QFile file(path.get());
     if (!file.open(QFile::ReadWrite | QFile::Truncate)) {
         return file.errorString();
     }
@@ -431,9 +431,9 @@ HydrationJob* VfsXAttr::hydrateFile(const QByteArray &fileId, const QString &tar
 
 bool VfsXAttr::needsMetadataUpdate(const SyncFileItem &item)
 {
-    const QString path = params().filesystemPath + item.localName();
+    const auto path = params().root() / item.localName();
     // if the attributes do not exist we need to add them
-    return QFileInfo::exists(path) && !placeHolderAttributes(path);
+    return QFileInfo::exists(path.toString()) && !placeHolderAttributes(path);
 }
 
 bool VfsXAttr::isDehydratedPlaceholder(const QString &filePath)
@@ -465,8 +465,8 @@ LocalInfo VfsXAttr::statTypeVirtualFile(const std::filesystem::directory_entry &
 
 bool VfsXAttr::setPinState(const QString &folderPath, PinState state)
 {
-    const QString localPath = params().filesystemPath + folderPath;
-    qCDebug(lcVfsXAttr) << localPath << state;
+    const auto localPath = params().root() / folderPath;
+    qCDebug(lcVfsXAttr) << localPath.toString() << state;
     auto attribs = placeHolderAttributes(localPath);
     if (!attribs) {
         // the file is not yet converted
@@ -481,7 +481,7 @@ bool VfsXAttr::setPinState(const QString &folderPath, PinState state)
 
 Optional<PinState> VfsXAttr::pinState(const QString &folderPath)
 {
-    const auto attribs = placeHolderAttributes(params().filesystemPath + folderPath);
+    const auto attribs = placeHolderAttributes(params().root() / folderPath);
     if (!attribs) {
         qCDebug(lcVfsXAttr) << u"Couldn't find pin state for regular non-placeholder file" << folderPath;
         return {};
@@ -491,7 +491,7 @@ Optional<PinState> VfsXAttr::pinState(const QString &folderPath)
 
 Vfs::AvailabilityResult VfsXAttr::availability(const QString &folderPath)
 {
-    const auto attribs = placeHolderAttributes(params().filesystemPath + folderPath);
+    const auto attribs = placeHolderAttributes(params().root() / folderPath);
     if (attribs) {
         switch (convertPinState(attribs.pinState)) {
         case OCC::PinState::AlwaysLocal:
@@ -523,8 +523,8 @@ Vfs::AvailabilityResult VfsXAttr::availability(const QString &folderPath)
 void VfsXAttr::fileStatusChanged(const QString& systemFileName, SyncFileStatus fileStatus)
 {
     if (fileStatus.tag() == SyncFileStatus::StatusExcluded) {
-        const QString rel = systemFileName.mid(params().filesystemPath.length());
-        setPinState(rel, PinState::Excluded);
+        const FileSystem::Path rel = std::filesystem::relative(FileSystem::Path(systemFileName), params().root());
+        setPinState(rel.toString(), PinState::Excluded);
         return;
     }
     qCDebug(lcVfsXAttr) << systemFileName << fileStatus;
